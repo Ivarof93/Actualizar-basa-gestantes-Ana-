@@ -1,107 +1,89 @@
 import pandas as pd
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import filedialog, messagebox
 import os
-from openpyxl import load_workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import Border, Side
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
-def aplicar_estilo_excel(ruta_archivo):
-    wb = load_workbook(ruta_archivo)
+# Función para cargar archivo Excel
+def cargar_archivo():
+    ruta_archivo = filedialog.askopenfilename(title="Seleccionar archivo base de gestantes", filetypes=[("Archivos Excel", "*.xlsx")])
+    return ruta_archivo
 
-    for sheet in wb.sheetnames:
-        ws = wb[sheet]
-
-        # Aplicar filtros
-        ws.auto_filter.ref = ws.dimensions
-
-        # Autoajustar ancho de columnas
-        for col in ws.columns:
-            max_length = 0
-            column = col[0].column_letter
-            for cell in col:
-                try:
-                    if cell.value:
-                        max_length = max(max_length, len(str(cell.value)))
-                except:
-                    pass
-            ws.column_dimensions[column].width = max_length + 2
-
-        # Agregar bordes
-        border = Border(left=Side(style='thin'),
-                        right=Side(style='thin'),
-                        top=Side(style='thin'),
-                        bottom=Side(style='thin'))
-
-        for row in ws.iter_rows():
-            for cell in row:
-                cell.border = border
-
-    wb.save(ruta_archivo)
-
-def actualizar_base():
-    archivo_base = filedialog.askopenfilename(title="Selecciona el archivo BASE", filetypes=[("Excel files", "*.xlsx")])
-    archivo_nuevo = filedialog.askopenfilename(title="Selecciona el archivo NUEVO", filetypes=[("Excel files", "*.xlsx")])
-
-    if not archivo_base or not archivo_nuevo:
-        messagebox.showerror("Error", "Debe seleccionar ambos archivos")
+# Función principal
+def procesar_archivos():
+    # Seleccionar archivos
+    archivo_base = cargar_archivo()
+    if not archivo_base:
         return
 
-    base = pd.read_excel(archivo_base, sheet_name="base Gestantes", dtype=str)
-    atenciones = pd.read_excel(archivo_nuevo, sheet_name="Atenciones", dtype=str)
-    usuarias = pd.read_excel(archivo_nuevo, sheet_name="Usuarias", dtype=str)
-
-    ids_existentes = base['Número de identificación de la usuaria'].astype(str).unique()
-    ids_atenciones = atenciones['3 - Número de identificación de la usuaria'].astype(str).unique()
-
-    nuevas_ids = [id_ for id_ in ids_atenciones if id_ not in ids_existentes]
-
-    if not nuevas_ids:
-        messagebox.showinfo("Información", "No se encontraron nuevas pacientes para agregar.")
+    archivo_atenciones = filedialog.askopenfilename(title="Seleccionar archivo de atenciones", filetypes=[("Archivos Excel", "*.xlsx")])
+    if not archivo_atenciones:
         return
 
-    nuevas_pacientes = usuarias[usuarias['7 - Número de identificación de la usuaria'].astype(str).isin(nuevas_ids)]
+    # Leer archivos
+    base = pd.read_excel(archivo_base)
+    atenciones = pd.read_excel(archivo_atenciones, sheet_name="Atenciones")
+    usuarias = pd.read_excel(archivo_atenciones, sheet_name="Usuarias")
 
-    mapeo_columnas = {
-        '6 - Tipo de identificación de la usuaria': 'Tipo de identificación de la usuaria',
-        '7 - Número de identificación de la usuaria': 'Número de identificación de la usuaria',
-        '8 - Primer apellido de la usuaria': 'Primer apellido de la usuaria',
-        '9 - Segundo apellido de la usuaria': 'Segundo apellido de la usuaria',
-        '10 - Primer nombre de la usuaria': 'Primer nombre de la usuaria',
-        '11 - Segundo nombre de la usuaria': 'Segundo nombre de la usuaria',
-        '12 - Fecha de nacimiento': 'Fecha de nacimiento',
-        '16 - Fecha probable de parto': 'FPP'
-    }
+    print(f"Registros base: {len(base)}")
+    print(f"Registros atenciones: {len(atenciones)}")
 
-    nuevas_pacientes = nuevas_pacientes[mapeo_columnas.keys()].rename(columns=mapeo_columnas)
+    # Homologar columnas
+    columnas_base = ['Tipo de identificación de la usuaria', 'Número de identificación de la usuaria', 'Primer apellido de la usuaria',
+                     'Segundo apellido de la usuaria', 'Primer nombre de la usuaria', 'Segundo nombre de la usuaria',
+                     'Fecha de nacimiento', 'Departamento', 'Municipio', 'FPP', 'FECHA ULTIMA CONTROL', 'ultimos 45 dias',
+                     'No de Controles', 'GINECOLOGO', 'Riesgo preclamsia', 'Clasificación del Riesgo obstetrico',
+                     'Suministro de ácido acetilsalicílico - AS', 'TAMIZAJES ITS', 'fecha de parto', 'POSPARTO.']
 
-    base_actualizada = pd.concat([base, nuevas_pacientes], ignore_index=True)
+    datos_finales = pd.DataFrame(columns=columnas_base)
 
-    nombre_salida = simpledialog.askstring("Nombre del Archivo", "Ingrese el nombre del archivo de salida (sin extensión):")
+    for _, row in atenciones.iterrows():
+        identificacion = row['3 - Número de identificación de la usuaria']
+        usuaria = usuarias[usuarias['7 - Número de identificación de la usuaria'] == identificacion].head(1)
 
-    if not nombre_salida:
-        nombre_salida = "base_actualizada"
+        nuevo_registro = {
+            'Tipo de identificación de la usuaria': row['2 - Tipo de documento de la usuaria'],
+            'Número de identificación de la usuaria': identificacion,
+            'Primer apellido de la usuaria': usuaria['8 - Primer apellido de la usuaria'].values[0] if not usuaria.empty else '',
+            'Segundo apellido de la usuaria': usuaria['9 - Segundo apellido de la usuaria'].values[0] if not usuaria.empty else '',
+            'Primer nombre de la usuaria': usuaria['10 - Primer nombre de la usuaria'].values[0] if not usuaria.empty else '',
+            'Segundo nombre de la usuaria': usuaria['11 - Segundo nombre de la usuaria'].values[0] if not usuaria.empty else '',
+            'Fecha de nacimiento': usuaria['12 - Fecha de nacimiento'].values[0] if not usuaria.empty else '',
+            'Departamento': '',
+            'Municipio': '',
+            'FPP': usuaria['16 - Fecha probable de parto'].values[0] if not usuaria.empty else '',
+            'FECHA ULTIMA CONTROL': row['4 - Fecha de la tecnología en salud'],
+            'ultimos 45 dias': '',
+            'No de Controles': '',
+            'GINECOLOGO': '',
+            'Riesgo preclamsia': row['8 - Clasificación del riesgo de preeclampsia'],
+            'Clasificación del Riesgo obstetrico': row['7 - Clasificación del riesgo gestacional'],
+            'Suministro de ácido acetilsalicílico - AS': row['9 - Suministro de ácido acetilsalicílico ASA'],
+            'TAMIZAJES ITS': '',
+            'fecha de parto': row['16 - Fecha de terminación de la gestación'],
+            'POSPARTO.': ''
+        }
 
-    ruta_salida = os.path.join(os.path.dirname(archivo_base), f"{nombre_salida}.xlsx")
+        datos_finales = pd.concat([datos_finales, pd.DataFrame([nuevo_registro])], ignore_index=True)
 
-    with pd.ExcelWriter(ruta_salida, engine='openpyxl') as writer:
-        base_actualizada.to_excel(writer, sheet_name="base Gestantes", index=False)
-        nuevas_pacientes.to_excel(writer, sheet_name="pacientes nuevas", index=False)
+    print(f"Registros nuevas atenciones: {len(datos_finales)}")
 
-    aplicar_estilo_excel(ruta_salida)
+    # Concatenar bases
+    resultado_final = pd.concat([base, datos_finales], ignore_index=True)
 
-    messagebox.showinfo("Proceso Finalizado", f"Se agregaron {len(nuevas_pacientes)} nuevas pacientes.\nArchivo guardado en:\n{ruta_salida}")
+    print(f"Total registros finales: {len(resultado_final)}")
 
-# Interfaz Tkinter
+    # Guardar archivo en misma ruta
+    ruta_salida = os.path.join(os.path.dirname(archivo_base), 'Base_Actualizada.xlsx')
+    resultado_final.to_excel(ruta_salida, index=False)
+
+    messagebox.showinfo("Proceso finalizado", f"Archivo guardado en: {ruta_salida}")
+
+# Interfaz gráfica
 ventana = tk.Tk()
 ventana.title("Actualizar Base de Gestantes")
 ventana.geometry("400x200")
 
-etiqueta = tk.Label(ventana, text="Actualizar Base de Gestantes", font=("Arial", 14))
-etiqueta.pack(pady=20)
-
-boton = tk.Button(ventana, text="Seleccionar Archivos y Actualizar", command=actualizar_base, font=("Arial", 12))
-boton.pack()
+boton = tk.Button(ventana, text="Seleccionar Archivos y Procesar", command=procesar_archivos)
+boton.pack(expand=True)
 
 ventana.mainloop()
