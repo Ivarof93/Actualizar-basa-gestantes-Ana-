@@ -1,89 +1,506 @@
+# -*- coding: utf-8 -*-
 import pandas as pd
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, simpledialog, messagebox
+from datetime import datetime
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, Border, Side, Alignment, PatternFill, NamedStyle
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import CellIsRule
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.worksheet.header_footer import HeaderFooter
+from typing import List, Dict, Union, Optional, Tuple
+from dataclasses import dataclass
 import os
+from openpyxl.utils.dataframe import dataframe_to_rows
 
-# Función para cargar archivo Excel
-def cargar_archivo():
-    ruta_archivo = filedialog.askopenfilename(title="Seleccionar archivo base de gestantes", filetypes=[("Archivos Excel", "*.xlsx")])
-    return ruta_archivo
 
-# Función principal
-def procesar_archivos():
-    # Seleccionar archivos
-    archivo_base = cargar_archivo()
-    if not archivo_base:
-        return
+# --- Configuración usando dataclass ---
+@dataclass
+class Config:
+    CUPS_CONTROLES: List[int] = (890301, 890305, 890205, 890201, 890250, 890350, 890101, 890105)
+    CUPS_GINECOLOGO: List[int] = (890250, 890350)
+    CUPS_ITS: List[int] = (906220, 906317, 906318, 906222, 906223, 906324, 906249, 906039)
+    CUPS_PARTO: List[int] = (735301, 740002, 740001, 740003, 750101, 750302)
+    CUPS_POSPARTO: List[int] = (890301, 890201, 890101)
+    FINALIDAD_POSPARTO: List[str] = ('01', '02', '1', '2')
+    DIAS_UMBRAL: int = 45
+    COLOR_CONTROLES_RECIENTES: str = "C6EFCE"
+    COLOR_CONTROLES_VENCIDOS: str = "FFC7CE"
+    COLOR_ENCABEZADO: str = "4F81BD"
+    COLOR_BORDES: str = "D3D3D3"
 
-    archivo_atenciones = filedialog.askopenfilename(title="Seleccionar archivo de atenciones", filetypes=[("Archivos Excel", "*.xlsx")])
-    if not archivo_atenciones:
-        return
+    @property
+    def COLUMNAS_OBLIGATORIAS_ACUM(self) -> Tuple[str, ...]:
+        return (
+            'Tipo de identificación de la usuaria',
+            'Número de identificación de la usuaria',
+            'FECHA ULTIMA CONTROL',
+            'No de Controles',
+            'GINECOLOGO',
+            'Riesgo preclamsia',
+            'Clasificación del Riesgo obstetrico',
+            'Suministro de ácido acetilsalicílico - AS',
+            'TAMIZAJES ITS',
+            'fecha de parto',
+            'POSPARTO'
+        )
 
-    # Leer archivos
-    base = pd.read_excel(archivo_base)
-    atenciones = pd.read_excel(archivo_atenciones, sheet_name="Atenciones")
-    usuarias = pd.read_excel(archivo_atenciones, sheet_name="Usuarias")
+    @property
+    def COLUMNAS_OBLIGATORIAS_SEM(self) -> Tuple[str, ...]:
+        return (
+            'Tipo identificación Usuaria',
+            'No Identificación',
+            'Fecha de la tecnología en salud',
+            'Código CUPS de la tecnología en salud',
+            'Clasificación del riesgo de preeclampsia',
+            'Clasificación del riesgo gestacional',
+            'Suministro de ácido acetilsalicílico - AS',
+            'Finalidad de la tecnología en salud (Consultas o procedimientos)'
+        )
 
-    print(f"Registros base: {len(base)}")
-    print(f"Registros atenciones: {len(atenciones)}")
 
-    # Homologar columnas
-    columnas_base = ['Tipo de identificación de la usuaria', 'Número de identificación de la usuaria', 'Primer apellido de la usuaria',
-                     'Segundo apellido de la usuaria', 'Primer nombre de la usuaria', 'Segundo nombre de la usuaria',
-                     'Fecha de nacimiento', 'Departamento', 'Municipio', 'FPP', 'FECHA ULTIMA CONTROL', 'ultimos 45 dias',
-                     'No de Controles', 'GINECOLOGO', 'Riesgo preclamsia', 'Clasificación del Riesgo obstetrico',
-                     'Suministro de ácido acetilsalicílico - AS', 'TAMIZAJES ITS', 'fecha de parto', 'POSPARTO.']
+# --- Funciones auxiliares ---
+def obtener_fecha_max(fechas: pd.Series) -> pd.Timestamp:
+    return pd.to_datetime(fechas, errors='coerce').max()
 
-    datos_finales = pd.DataFrame(columns=columnas_base)
 
-    for _, row in atenciones.iterrows():
-        identificacion = row['3 - Número de identificación de la usuaria']
-        usuaria = usuarias[usuarias['7 - Número de identificación de la usuaria'] == identificacion].head(1)
+def actualizar_valor(previo: str, nuevo: str, valores_no_reemplazo: List[str]) -> str:
+    return previo if previo in valores_no_reemplazo and nuevo not in valores_no_reemplazo else nuevo
 
-        nuevo_registro = {
-            'Tipo de identificación de la usuaria': row['2 - Tipo de documento de la usuaria'],
-            'Número de identificación de la usuaria': identificacion,
-            'Primer apellido de la usuaria': usuaria['8 - Primer apellido de la usuaria'].values[0] if not usuaria.empty else '',
-            'Segundo apellido de la usuaria': usuaria['9 - Segundo apellido de la usuaria'].values[0] if not usuaria.empty else '',
-            'Primer nombre de la usuaria': usuaria['10 - Primer nombre de la usuaria'].values[0] if not usuaria.empty else '',
-            'Segundo nombre de la usuaria': usuaria['11 - Segundo nombre de la usuaria'].values[0] if not usuaria.empty else '',
-            'Fecha de nacimiento': usuaria['12 - Fecha de nacimiento'].values[0] if not usuaria.empty else '',
-            'Departamento': '',
-            'Municipio': '',
-            'FPP': usuaria['16 - Fecha probable de parto'].values[0] if not usuaria.empty else '',
-            'FECHA ULTIMA CONTROL': row['4 - Fecha de la tecnología en salud'],
-            'ultimos 45 dias': '',
-            'No de Controles': '',
+
+def validar_columnas(df: pd.DataFrame, columnas_obligatorias: Tuple[str, ...], nombre_archivo: str) -> None:
+    faltantes = [col for col in columnas_obligatorias if col not in df.columns]
+    if faltantes:
+        raise ValueError(
+            f"El archivo {nombre_archivo} no tiene las columnas requeridas.\n"
+            f"Faltan: {', '.join(faltantes)}\n"
+            f"Columnas disponibles: {', '.join(df.columns)}"
+        )
+
+
+def estandarizar_fechas(df: pd.DataFrame) -> pd.DataFrame:
+    """Estandariza todas las columnas de fecha en el DataFrame."""
+    columnas_fecha = [
+        'FECHA ULTIMA CONTROL',
+        'fecha de parto',
+        'TAMIZAJES ITS',
+        'Fecha de la tecnología en salud'
+    ]
+
+    for col in columnas_fecha:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+
+    # Procesar campo GINECOLOGO para mantener solo la fecha más reciente
+    if 'GINECOLOGO' in df.columns:
+        def obtener_fecha_reciente(x):
+            if pd.isna(x) or str(x).strip() == '':
+                return ''
+
+            fechas = []
+            for f in str(x).split(','):
+                fecha = pd.to_datetime(f.strip(), errors='coerce')
+                if pd.notna(fecha):
+                    fechas.append(fecha)
+
+            if not fechas:
+                return ''
+
+            return max(fechas).strftime('%Y-%m-%d')
+
+        df['GINECOLOGO'] = df['GINECOLOGO'].apply(obtener_fecha_reciente)
+
+    return df
+
+
+# --- Clase para manejar la interfaz de usuario ---
+class InterfazUsuario:
+    @staticmethod
+    def cargar_archivos() -> Tuple[str, str, pd.Timestamp]:
+        root = tk.Tk()
+        root.withdraw()
+
+        file_acum = filedialog.askopenfilename(
+            title="Seleccione el archivo Acumulado",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not file_acum:
+            raise FileNotFoundError("No se seleccionó archivo acumulado")
+
+        file_semanal = filedialog.askopenfilename(
+            title="Seleccione el archivo Semanal",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if not file_semanal:
+            raise FileNotFoundError("No se seleccionó archivo semanal")
+
+        fecha_corte = InterfazUsuario._obtener_fecha_valida()
+
+        return file_acum, file_semanal, fecha_corte
+
+    @staticmethod
+    def _obtener_fecha_valida() -> pd.Timestamp:
+        intentos = 3
+        for i in range(intentos):
+            fecha_corte = simpledialog.askstring(
+                "Fecha de corte",
+                f"Ingrese la fecha de corte (YYYY-MM-DD) (Intento {i + 1}/{intentos}):"
+            )
+            try:
+                return pd.to_datetime(fecha_corte)
+            except ValueError:
+                if i == intentos - 1:
+                    raise ValueError("Número máximo de intentos alcanzado. Formato de fecha inválido.")
+                messagebox.showerror("Error", "Formato de fecha inválido. Use YYYY-MM-DD")
+
+    @staticmethod
+    def guardar_archivo() -> str:
+        root = tk.Tk()
+        root.withdraw()
+        return filedialog.asksaveasfilename(
+            title="Guardar como",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")]
+        )
+
+
+# --- Procesamiento de datos ---
+class ProcesadorDatos:
+    def __init__(self, config: Config = Config()):
+        self.config = config
+        self._preparar_cups()
+
+    def _preparar_cups(self) -> None:
+        self.cups_controles_str = set(map(str, self.config.CUPS_CONTROLES))
+        self.cups_ginecologo_str = set(map(str, self.config.CUPS_GINECOLOGO))
+        self.cups_its_str = set(map(str, self.config.CUPS_ITS))
+        self.cups_parto_str = set(map(str, self.config.CUPS_PARTO))
+        self.cups_posparto_str = set(map(str, self.config.CUPS_POSPARTO))
+
+    def procesar(self, df_acum: pd.DataFrame, df_sem: pd.DataFrame, fecha_corte: pd.Timestamp) -> pd.DataFrame:
+        """Procesa los datos semanales y actualiza el acumulado."""
+        df_acum = df_acum.copy()
+        df_sem = estandarizar_fechas(df_sem.copy())
+
+        # Reiniciar todos los contadores
+        df_acum['No de Controles'] = 0
+        df_acum['GINECOLOGO'] = ''
+        df_acum['TAMIZAJES ITS'] = None
+        df_acum['fecha de parto'] = None
+
+        # Procesar por paciente
+        for (tipo_id, num_id), group in df_sem.groupby(['Tipo identificación Usuaria', 'No Identificación']):
+            # Buscar o crear registro en acumulado
+            mask = (df_acum['Tipo de identificación de la usuaria'] == tipo_id) & \
+                   (df_acum['Número de identificación de la usuaria'] == num_id)
+
+            if not mask.any():
+                self._agregar_nueva_fila(df_acum, tipo_id, num_id)
+                idx = df_acum.index[-1]
+            else:
+                idx = df_acum[mask].index[0]
+
+            # Calcular número de controles (solo de datos semanales)
+            controles = group['Código CUPS de la tecnología en salud'].isin(self.cups_controles_str).sum()
+            df_acum.at[idx, 'No de Controles'] = controles
+
+            # Procesar otros campos
+            for _, fila_sem in group.iterrows():
+                self._procesar_otros_campos(df_acum, fila_sem, idx)
+
+        # Calcular días desde último control
+        df_acum['ultimos 45 dias'] = (fecha_corte - pd.to_datetime(df_acum['FECHA ULTIMA CONTROL'])).dt.days
+
+        # Formatear fechas para visualización consistente
+        date_cols = ['FECHA ULTIMA CONTROL', 'fecha de parto', 'TAMIZAJES ITS']
+        for col in date_cols:
+            if col in df_acum.columns:
+                df_acum[col] = pd.to_datetime(df_acum[col]).dt.strftime('%Y-%m-%d')
+
+        return df_acum
+
+    def _agregar_nueva_fila(self, df_acum: pd.DataFrame, tipo_id: str, num_id: str) -> None:
+        nueva_fila = {
+            'Tipo de identificación de la usuaria': tipo_id,
+            'Número de identificación de la usuaria': num_id,
+            'FECHA ULTIMA CONTROL': None,
+            'No de Controles': 0,
             'GINECOLOGO': '',
-            'Riesgo preclamsia': row['8 - Clasificación del riesgo de preeclampsia'],
-            'Clasificación del Riesgo obstetrico': row['7 - Clasificación del riesgo gestacional'],
-            'Suministro de ácido acetilsalicílico - AS': row['9 - Suministro de ácido acetilsalicílico ASA'],
-            'TAMIZAJES ITS': '',
-            'fecha de parto': row['16 - Fecha de terminación de la gestación'],
-            'POSPARTO.': ''
+            'Riesgo preclamsia': 'NO EVALUADO',
+            'Clasificación del Riesgo obstetrico': 'NO EVALUADO',
+            'Suministro de ácido acetilsalicílico - AS': 'NO APLICA',
+            'TAMIZAJES ITS': None,
+            'fecha de parto': None,
+            'POSPARTO': 'NO'
         }
+        df_acum.loc[len(df_acum)] = nueva_fila
 
-        datos_finales = pd.concat([datos_finales, pd.DataFrame([nuevo_registro])], ignore_index=True)
+    def _procesar_otros_campos(self, df_acum: pd.DataFrame, fila_sem: pd.Series, idx: int) -> None:
+        """Procesa todos los campos excepto el número de controles."""
+        cups = fila_sem['Código CUPS de la tecnología en salud']
+        fecha_actual = fila_sem['Fecha de la tecnología en salud']
 
-    print(f"Registros nuevas atenciones: {len(datos_finales)}")
+        self._actualizar_fecha_control(df_acum, fecha_actual, idx)
 
-    # Concatenar bases
-    resultado_final = pd.concat([base, datos_finales], ignore_index=True)
+        if cups in self.cups_ginecologo_str and pd.notna(fecha_actual):
+            self._actualizar_fechas_ginecologo(df_acum, fecha_actual, idx)
 
-    print(f"Total registros finales: {len(resultado_final)}")
+        self._actualizar_riesgos(df_acum, fila_sem, idx)
 
-    # Guardar archivo en misma ruta
-    ruta_salida = os.path.join(os.path.dirname(archivo_base), 'Base_Actualizada.xlsx')
-    resultado_final.to_excel(ruta_salida, index=False)
+        if cups in self.cups_its_str and pd.notna(fecha_actual):
+            self._actualizar_its(df_acum, fecha_actual, idx)
 
-    messagebox.showinfo("Proceso finalizado", f"Archivo guardado en: {ruta_salida}")
+        if cups in self.cups_parto_str and pd.notna(fecha_actual):
+            df_acum.at[idx, 'fecha de parto'] = fecha_actual
 
-# Interfaz gráfica
-ventana = tk.Tk()
-ventana.title("Actualizar Base de Gestantes")
-ventana.geometry("400x200")
+        if (cups in self.cups_posparto_str and
+                fila_sem[
+                    'Finalidad de la tecnología en salud (Consultas o procedimientos)'] in self.config.FINALIDAD_POSPARTO):
+            df_acum.at[idx, 'POSPARTO'] = 'SI'
 
-boton = tk.Button(ventana, text="Seleccionar Archivos y Procesar", command=procesar_archivos)
-boton.pack(expand=True)
+    def _actualizar_fecha_control(self, df_acum: pd.DataFrame, fecha_actual: pd.Timestamp, idx: int) -> None:
+        fecha_ultima = pd.to_datetime(df_acum.at[idx, 'FECHA ULTIMA CONTROL'], errors='coerce')
+        fecha_actual = pd.to_datetime(fecha_actual, errors='coerce')
 
-ventana.mainloop()
+        if pd.isna(fecha_ultima) or (pd.notna(fecha_actual) and fecha_actual > fecha_ultima):
+            df_acum.at[idx, 'FECHA ULTIMA CONTROL'] = fecha_actual
+
+    def _actualizar_fechas_ginecologo(self, df_acum: pd.DataFrame, fecha_actual: pd.Timestamp, idx: int) -> None:
+        fecha_actual = pd.to_datetime(fecha_actual, errors='coerce')
+        if pd.isna(fecha_actual):
+            return
+
+        fecha_existente = pd.to_datetime(df_acum.at[idx, 'GINECOLOGO'], errors='coerce')
+
+        if pd.isna(fecha_existente) or fecha_actual > fecha_existente:
+            df_acum.at[idx, 'GINECOLOGO'] = fecha_actual.strftime('%Y-%m-%d')
+
+    def _actualizar_riesgos(self, df_acum: pd.DataFrame, fila_sem: pd.Series, idx: int) -> None:
+        MAPEO_RIESGOS = {'21': 'NO EVALUADO', '4': 'ALTO', '5': 'BAJO'}
+        MAPEO_AS = {'21': 'NO APLICA', '1': 'SI', '0': 'NO'}
+
+        df_acum.at[idx, 'Riesgo preclamsia'] = actualizar_valor(
+            df_acum.at[idx, 'Riesgo preclamsia'],
+            MAPEO_RIESGOS.get(fila_sem['Clasificación del riesgo de preeclampsia'], 'NO EVALUADO'),
+            ['ALTO', 'BAJO']
+        )
+
+        df_acum.at[idx, 'Clasificación del Riesgo obstetrico'] = actualizar_valor(
+            df_acum.at[idx, 'Clasificación del Riesgo obstetrico'],
+            MAPEO_RIESGOS.get(fila_sem['Clasificación del riesgo gestacional'], 'NO EVALUADO'),
+            ['ALTO', 'BAJO']
+        )
+
+        df_acum.at[idx, 'Suministro de ácido acetilsalicílico - AS'] = actualizar_valor(
+            df_acum.at[idx, 'Suministro de ácido acetilsalicílico - AS'],
+            MAPEO_AS.get(fila_sem['Suministro de ácido acetilsalicílico - AS'], 'NO APLICA'),
+            ['SI', 'NO']
+        )
+
+    def _actualizar_its(self, df_acum: pd.DataFrame, fecha_actual: pd.Timestamp, idx: int) -> None:
+        fecha_its = pd.to_datetime(df_acum.at[idx, 'TAMIZAJES ITS'], errors='coerce')
+        fecha_actual = pd.to_datetime(fecha_actual, errors='coerce')
+
+        if pd.isna(fecha_its) or (pd.notna(fecha_actual) and fecha_actual > fecha_its):
+            df_acum.at[idx, 'TAMIZAJES ITS'] = fecha_actual
+
+
+# --- Exportación a Excel ---
+class ExportadorExcel:
+    def __init__(self, config: Config = Config()):
+        self.config = config
+        self._crear_estilos()
+
+    def _crear_estilos(self) -> None:
+        self.header_style = NamedStyle(name="header_style")
+        self.header_style.font = Font(bold=True, color="FFFFFF", size=12)
+        self.header_style.fill = PatternFill(
+            start_color=self.config.COLOR_ENCABEZADO,
+            end_color=self.config.COLOR_ENCABEZADO,
+            fill_type="solid"
+        )
+        self.header_style.border = Border(
+            bottom=Side(border_style="thin", color="000000")
+        )
+        self.header_style.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        self.data_style = NamedStyle(name="data_style")
+        self.data_style.font = Font(size=11)
+        self.data_style.alignment = Alignment(horizontal="center", vertical="center")
+        self.data_style.border = Border(
+            left=Side(border_style="thin", color=self.config.COLOR_BORDES),
+            right=Side(border_style="thin", color=self.config.COLOR_BORDES),
+            top=Side(border_style="thin", color=self.config.COLOR_BORDES),
+            bottom=Side(border_style="thin", color=self.config.COLOR_BORDES)
+        )
+
+    def exportar(self, df: pd.DataFrame, output_file: str) -> None:
+        """Exporta el DataFrame a Excel con formato profesional."""
+        try:
+            # Crear un nuevo libro de trabajo
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Seguimiento Prenatal"
+
+            # Escribir título en fila 1
+            ws.append([f"REPORTE DE SEGUIMIENTO PRENATAL - {datetime.now().strftime('%d/%m/%Y')}"])
+            ws.merge_cells(f"A1:{get_column_letter(len(df.columns))}1")
+            title_cell = ws['A1']
+            title_cell.font = Font(bold=True, size=14, color="1F497D")
+            title_cell.alignment = Alignment(horizontal="center")
+
+            # Escribir encabezados en fila 2
+            ws.append(list(df.columns))
+
+            # Escribir datos desde fila 3
+            for row in dataframe_to_rows(df, index=False, header=False):
+                ws.append(row)
+
+            # Aplicar estilos
+            self._aplicar_estilos(wb, df)
+
+            # Guardar con validación
+            temp_file = output_file.replace('.xlsx', '_temp.xlsx')
+            wb.save(temp_file)
+
+            # Verificar integridad del archivo
+            try:
+                test_wb = load_workbook(temp_file)
+                test_wb.close()
+                os.replace(temp_file, output_file)
+            except Exception as e:
+                os.remove(temp_file)
+                raise ValueError(f"Error al validar el archivo Excel: {str(e)}")
+
+        except Exception as e:
+            raise ValueError(f"Error al generar el archivo Excel: {str(e)}")
+
+    def _aplicar_estilos(self, wb, df: pd.DataFrame) -> None:
+        """Aplica estilos profesionales al libro de Excel."""
+        ws = wb.active
+
+        # Añadir estilos al libro
+        if "header_style" not in wb.named_styles:
+            wb.add_named_style(self.header_style)
+        if "data_style" not in wb.named_styles:
+            wb.add_named_style(self.data_style)
+
+        # Estilo para encabezados (fila 2)
+        for col in range(1, len(df.columns) + 1):
+            cell = ws.cell(row=2, column=col)
+            cell.style = "header_style"
+
+        # Estilo para datos (filas 3 en adelante)
+        for row in range(3, len(df) + 3):
+            for col in range(1, len(df.columns) + 1):
+                ws.cell(row=row, column=col).style = "data_style"
+
+        # Formato condicional para columna "ultimos 45 dias"
+        if 'ultimos 45 dias' in df.columns:
+            col_45_dias = df.columns.get_loc('ultimos 45 dias') + 1
+            col_letter = get_column_letter(col_45_dias)
+            range_str = f"{col_letter}3:{col_letter}{len(df) + 2}"
+
+            green_fill = PatternFill(
+                start_color=self.config.COLOR_CONTROLES_RECIENTES,
+                end_color=self.config.COLOR_CONTROLES_RECIENTES,
+                fill_type="solid"
+            )
+
+            # Solo resaltar valores entre 1 y 45 días
+            ws.conditional_formatting.add(
+                range_str,
+                CellIsRule(operator='between', formula=['1', '45'], fill=green_fill)
+            )
+
+        # Ajustar anchos de columna
+        for i, col in enumerate(df.columns, 1):
+            max_length = max(
+                df[col].astype(str).apply(len).max(),
+                len(col) + 2
+            )
+            ws.column_dimensions[get_column_letter(i)].width = min(max_length, 50)
+
+        # Configuraciones adicionales
+        self._configuraciones_adicionales(ws, df)
+
+    def _configuraciones_adicionales(self, ws, df: pd.DataFrame) -> None:
+        """Configuraciones adicionales de la hoja de cálculo."""
+        # Filtro automático en fila 2 (encabezados de columna)
+        ws.auto_filter.ref = f"A2:{get_column_letter(len(df.columns))}{len(df) + 2}"
+
+        # Congelar paneles debajo de los encabezados
+        ws.freeze_panes = "A3"
+
+        # Configurar tabla con estilo (los encabezados están en fila 2)
+        tab = Table(
+            displayName="TablaDatos",
+            ref=f"A2:{get_column_letter(len(df.columns))}{len(df) + 2}"
+        )
+        tab.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium9",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False
+        )
+        ws.add_table(tab)
+
+        # Configuración del pie de página
+        if not hasattr(ws, 'header_footer'):
+            ws.header_footer = HeaderFooter()
+
+        ws.header_footer.oddFooter.text = (
+            f"&LGenerado el {datetime.now().strftime('%d/%m/%Y %H:%M')} "
+            f"&C&10Reporte Prenatal &RPágina &P de &N"
+        )
+
+        # Propiedades del documento
+        wb = ws.parent
+        wb.properties.title = "Reporte Prenatal"
+        wb.properties.subject = "Seguimiento de controles prenatales"
+        wb.properties.author = "Departamento de Salud"
+        wb.properties.company = "Institución de Salud"
+
+
+# --- Función principal ---
+def main():
+    try:
+        config = Config()
+
+        file_acum, file_semanal, fecha_corte = InterfazUsuario.cargar_archivos()
+
+        # Leer y estandarizar datos
+        df_acum = pd.read_excel(file_acum, dtype=str)
+        df_sem = pd.read_excel(file_semanal, dtype=str)
+
+        # Aplicar estandarización de fechas
+        df_acum = estandarizar_fechas(df_acum.fillna(''))
+        df_sem = estandarizar_fechas(df_sem.fillna(''))
+
+        validar_columnas(df_acum, config.COLUMNAS_OBLIGATORIAS_ACUM, "acumulado")
+        validar_columnas(df_sem, config.COLUMNAS_OBLIGATORIAS_SEM, "semanal")
+
+        procesador = ProcesadorDatos(config)
+        df_acum_actualizado = procesador.procesar(df_acum, df_sem, fecha_corte)
+
+        output_file = InterfazUsuario.guardar_archivo()
+        if not output_file:
+            raise ValueError("Operación cancelada por el usuario")
+
+        exportador = ExportadorExcel(config)
+        exportador.exportar(df_acum_actualizado, output_file)
+
+        messagebox.showinfo(
+            "Éxito",
+            f"Reporte generado correctamente en:\n{output_file}"
+        )
+
+    except Exception as e:
+        messagebox.showerror("Error", f"Ocurrió un error: {str(e)}")
+        print(f"Error: {str(e)}")
+
+
+if __name__ == "__main__":
+    main()
