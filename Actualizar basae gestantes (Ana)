@@ -472,7 +472,7 @@ def main():
         file_acum, file_semanal, fecha_corte = InterfazUsuario.cargar_archivos()
 
         # Leer y estandarizar datos
-        df_acum = pd.read_excel(file_acum, dtype=str)
+        df_acum = pd.read_excel(file_acum, dtype=str, header=1)
         df_sem = pd.read_excel(file_semanal, dtype=str)
 
         # Aplicar estandarización de fechas
